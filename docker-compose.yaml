@@ -28,6 +28,8 @@ services:
   api:
     build: .
     restart: unless-stopped
+    ports:
+      - '${PORT:-3000}:3000'
     depends_on:
       db:
         condition: service_healthy

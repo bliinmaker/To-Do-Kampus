@@ -1,14 +1,29 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Telegraf, Context } from 'telegraf';
+import { Telegraf, Context, Markup } from 'telegraf';
 import { AuthService } from '../auth/auth.service';
 import { TasksService } from '../tasks/tasks.service';
 import { TaskStatus } from '@prisma/client';
 
+type WaitingFor =
+  | 'register_email'
+  | 'register_password'
+  | 'login_email'
+  | 'login_password'
+  | 'add_title';
+
 interface SessionData {
   userId?: string;
   email?: string;
+  waitingFor?: WaitingFor;
+  tempEmail?: string;
 }
+
+const STATUS_EMOJI: Record<string, string> = {
+  todo: '⬜',
+  in_progress: '🔄',
+  done: '✅',
+};
 
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
@@ -30,7 +45,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     }
 
     this.bot = new Telegraf(token);
-    this.setupCommands();
+    this.setupHandlers();
     await this.bot.launch();
     this.logger.log('Telegram bot started');
   }
@@ -46,121 +61,171 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     return this.sessions.get(chatId)!;
   }
 
-  private setupCommands(): void {
+  private mainMenu(loggedIn: boolean) {
+    if (!loggedIn) {
+      return Markup.keyboard([
+        ['🔐 Войти', '📝 Регистрация'],
+      ]).resize();
+    }
+
+    return Markup.keyboard([
+      ['➕ Новая задача', '📋 Мои задачи'],
+      ['⬜ Todo', '🔄 В работе', '✅ Готово'],
+      ['🗑 Архив', '🚪 Выйти'],
+    ]).resize();
+  }
+
+  private setupHandlers(): void {
     if (!this.bot) return;
 
     this.bot.command('start', (ctx) => this.handleStart(ctx));
-    this.bot.command('register', (ctx) => this.handleRegister(ctx));
-    this.bot.command('login', (ctx) => this.handleLogin(ctx));
-    this.bot.command('logout', (ctx) => this.handleLogout(ctx));
-    this.bot.command('add', (ctx) => this.handleAdd(ctx));
-    this.bot.command('list', (ctx) => this.handleList(ctx));
-    this.bot.command('done', (ctx) => this.handleDone(ctx));
-    this.bot.command('progress', (ctx) => this.handleProgress(ctx));
-    this.bot.command('delete', (ctx) => this.handleDelete(ctx));
-    this.bot.command('archive', (ctx) => this.handleArchive(ctx));
-    this.bot.command('restore', (ctx) => this.handleRestore(ctx));
-    this.bot.command('help', (ctx) => this.handleStart(ctx));
+
+    this.bot.hears('📝 Регистрация', (ctx) => this.startRegister(ctx));
+    this.bot.hears('🔐 Войти', (ctx) => this.startLogin(ctx));
+    this.bot.hears('🚪 Выйти', (ctx) => this.handleLogout(ctx));
+    this.bot.hears('➕ Новая задача', (ctx) => this.startAddTask(ctx));
+    this.bot.hears('📋 Мои задачи', (ctx) => this.handleList(ctx));
+    this.bot.hears('⬜ Todo', (ctx) => this.handleListByStatus(ctx, TaskStatus.todo));
+    this.bot.hears('🔄 В работе', (ctx) => this.handleListByStatus(ctx, TaskStatus.in_progress));
+    this.bot.hears('✅ Готово', (ctx) => this.handleListByStatus(ctx, TaskStatus.done));
+    this.bot.hears('🗑 Архив', (ctx) => this.handleArchive(ctx));
+
+    this.bot.action(/^status:(.+):(.+)$/, (ctx) => this.handleStatusAction(ctx));
+    this.bot.action(/^archive:(.+)$/, (ctx) => this.handleArchiveAction(ctx));
+    this.bot.action(/^restore:(.+)$/, (ctx) => this.handleRestoreAction(ctx));
+
+    this.bot.on('text', (ctx) => this.handleText(ctx));
   }
 
   private async handleStart(ctx: Context): Promise<void> {
     const session = this.getSession(ctx.chat!.id);
-    const status = session.userId
-      ? `Вы авторизованы как ${session.email}`
-      : 'Вы не авторизованы';
+    session.waitingFor = undefined;
 
     await ctx.reply(
-      `To-Do Bot\n\n${status}\n\n` +
-      'Команды:\n' +
-      '/register email password — регистрация\n' +
-      '/login email password — вход\n' +
-      '/logout — выход\n' +
-      '/add текст задачи — создать задачу\n' +
-      '/list [todo|in_progress|done] — список задач\n' +
-      '/done id — отметить выполненной\n' +
-      '/progress id — в работу\n' +
-      '/delete id — архивировать\n' +
-      '/archive — показать архив\n' +
-      '/restore id — восстановить из архива',
+      '👋 Привет! Я бот для управления задачами.\n\nВыберите действие:',
+      this.mainMenu(!!session.userId),
     );
   }
 
-  private async handleRegister(ctx: Context): Promise<void> {
-    const args = this.parseArgs(ctx);
-    if (args.length < 2) {
-      await ctx.reply('Формат: /register email password');
-      return;
-    }
-
-    const [email, password] = args;
-    try {
-      const result = await this.authService.register({ email, password });
-      const session = this.getSession(ctx.chat!.id);
-      session.userId = result.user.id;
-      session.email = result.user.email;
-      await ctx.reply(`Регистрация успешна! Вы вошли как ${email}`);
-    } catch (e: any) {
-      await ctx.reply(`Ошибка: ${e.message}`);
-    }
+  private async startRegister(ctx: Context): Promise<void> {
+    const session = this.getSession(ctx.chat!.id);
+    session.waitingFor = 'register_email';
+    await ctx.reply('📧 Введите ваш email:', Markup.forceReply());
   }
 
-  private async handleLogin(ctx: Context): Promise<void> {
-    const args = this.parseArgs(ctx);
-    if (args.length < 2) {
-      await ctx.reply('Формат: /login email password');
-      return;
-    }
-
-    const [email, password] = args;
-    try {
-      const result = await this.authService.login({ email, password });
-      const session = this.getSession(ctx.chat!.id);
-      session.userId = result.user.id;
-      session.email = result.user.email;
-      await ctx.reply(`Вы вошли как ${email}`);
-    } catch (e: any) {
-      await ctx.reply(`Ошибка: ${e.message}`);
-    }
+  private async startLogin(ctx: Context): Promise<void> {
+    const session = this.getSession(ctx.chat!.id);
+    session.waitingFor = 'login_email';
+    await ctx.reply('📧 Введите ваш email:', Markup.forceReply());
   }
 
   private async handleLogout(ctx: Context): Promise<void> {
     this.sessions.delete(ctx.chat!.id);
-    await ctx.reply('Вы вышли из аккаунта');
+    await ctx.reply('👋 Вы вышли из аккаунта', this.mainMenu(false));
   }
 
-  private async handleAdd(ctx: Context): Promise<void> {
+  private async startAddTask(ctx: Context): Promise<void> {
     const session = this.getSession(ctx.chat!.id);
     if (!session.userId) {
-      await ctx.reply('Сначала авторизуйтесь: /login или /register');
+      await ctx.reply('Сначала авторизуйтесь', this.mainMenu(false));
       return;
     }
+    session.waitingFor = 'add_title';
+    await ctx.reply('📝 Введите название задачи:', Markup.forceReply());
+  }
 
-    const title = this.parseArgs(ctx).join(' ');
+  private async handleText(ctx: Context): Promise<void> {
+    const text = (ctx.message as any)?.text;
+    if (!text) return;
+
+    const session = this.getSession(ctx.chat!.id);
+
+    switch (session.waitingFor) {
+      case 'register_email':
+        session.tempEmail = text.trim();
+        session.waitingFor = 'register_password';
+        await ctx.reply('🔑 Введите пароль (мин. 8 символов):', Markup.forceReply());
+        return;
+
+      case 'register_password':
+        await this.finishRegister(ctx, session, text.trim());
+        return;
+
+      case 'login_email':
+        session.tempEmail = text.trim();
+        session.waitingFor = 'login_password';
+        await ctx.reply('🔑 Введите пароль:', Markup.forceReply());
+        return;
+
+      case 'login_password':
+        await this.finishLogin(ctx, session, text.trim());
+        return;
+
+      case 'add_title':
+        await this.finishAddTask(ctx, session, text.trim());
+        return;
+    }
+  }
+
+  private async finishRegister(ctx: Context, session: SessionData, password: string): Promise<void> {
+    session.waitingFor = undefined;
+    const email = session.tempEmail!;
+    session.tempEmail = undefined;
+
+    try {
+      const result = await this.authService.register({ email, password });
+      session.userId = result.user.id;
+      session.email = result.user.email;
+      await ctx.reply(
+        `✅ Регистрация успешна!\n\nВы вошли как ${email}`,
+        this.mainMenu(true),
+      );
+    } catch (e: any) {
+      await ctx.reply(`❌ ${e.message}`, this.mainMenu(false));
+    }
+  }
+
+  private async finishLogin(ctx: Context, session: SessionData, password: string): Promise<void> {
+    session.waitingFor = undefined;
+    const email = session.tempEmail!;
+    session.tempEmail = undefined;
+
+    try {
+      const result = await this.authService.login({ email, password });
+      session.userId = result.user.id;
+      session.email = result.user.email;
+      await ctx.reply(
+        `✅ Вы вошли как ${email}`,
+        this.mainMenu(true),
+      );
+    } catch (e: any) {
+      await ctx.reply(`❌ ${e.message}`, this.mainMenu(false));
+    }
+  }
+
+  private async finishAddTask(ctx: Context, session: SessionData, title: string): Promise<void> {
+    session.waitingFor = undefined;
+
     if (!title) {
-      await ctx.reply('Формат: /add текст задачи');
+      await ctx.reply('Название не может быть пустым', this.mainMenu(true));
       return;
     }
 
     try {
-      const task = await this.tasksService.create(session.userId, { title });
-      await ctx.reply(`Задача создана!\nID: ${task.id}\nНазвание: ${task.title}`);
+      const task = await this.tasksService.create(session.userId!, { title });
+      await ctx.reply(
+        `✅ Задача создана!\n\n⬜ ${task.title}`,
+        this.mainMenu(true),
+      );
     } catch (e: any) {
-      await ctx.reply(`Ошибка: ${e.message}`);
+      await ctx.reply(`❌ ${e.message}`, this.mainMenu(true));
     }
   }
 
-  private async handleList(ctx: Context): Promise<void> {
+  private async handleList(ctx: Context, status?: TaskStatus): Promise<void> {
     const session = this.getSession(ctx.chat!.id);
     if (!session.userId) {
-      await ctx.reply('Сначала авторизуйтесь: /login или /register');
-      return;
-    }
-
-    const args = this.parseArgs(ctx);
-    const status = args[0] as TaskStatus | undefined;
-
-    if (status && !Object.values(TaskStatus).includes(status)) {
-      await ctx.reply('Статус: todo, in_progress или done');
+      await ctx.reply('Сначала авторизуйтесь', this.mainMenu(false));
       return;
     }
 
@@ -172,83 +237,48 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       });
 
       if (result.data.length === 0) {
-        await ctx.reply('Задач нет');
+        const label = status ? ` со статусом "${status}"` : '';
+        await ctx.reply(`📭 Задач${label} нет`, this.mainMenu(true));
         return;
       }
 
-      const statusEmoji: Record<string, string> = {
-        todo: '⬜',
-        in_progress: '🔄',
-        done: '✅',
-      };
+      for (const task of result.data) {
+        const buttons = [];
 
-      const lines = result.data.map(
-        (t) => `${statusEmoji[t.status] || ''} ${t.title}\nID: ${t.id}`,
-      );
+        if (task.status !== TaskStatus.done) {
+          buttons.push(Markup.button.callback('✅ Готово', `status:done:${task.id}`));
+        }
+        if (task.status !== TaskStatus.in_progress) {
+          buttons.push(Markup.button.callback('🔄 В работу', `status:in_progress:${task.id}`));
+        }
+        if (task.status !== TaskStatus.todo) {
+          buttons.push(Markup.button.callback('⬜ Todo', `status:todo:${task.id}`));
+        }
+        buttons.push(Markup.button.callback('🗑 Удалить', `archive:${task.id}`));
+
+        await ctx.reply(
+          `${STATUS_EMOJI[task.status]} ${task.title}`,
+          Markup.inlineKeyboard(buttons, { columns: 2 }),
+        );
+      }
 
       await ctx.reply(
-        `Задачи (${result.meta.total}):\n\n${lines.join('\n\n')}`,
+        `Всего: ${result.meta.total}`,
+        this.mainMenu(true),
       );
     } catch (e: any) {
-      await ctx.reply(`Ошибка: ${e.message}`);
+      await ctx.reply(`❌ ${e.message}`, this.mainMenu(true));
     }
   }
 
-  private async handleDone(ctx: Context): Promise<void> {
-    await this.updateStatus(ctx, TaskStatus.done);
-  }
-
-  private async handleProgress(ctx: Context): Promise<void> {
-    await this.updateStatus(ctx, TaskStatus.in_progress);
-  }
-
-  private async updateStatus(ctx: Context, status: TaskStatus): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
-    if (!session.userId) {
-      await ctx.reply('Сначала авторизуйтесь: /login или /register');
-      return;
-    }
-
-    const args = this.parseArgs(ctx);
-    if (!args[0]) {
-      await ctx.reply('Укажите ID задачи');
-      return;
-    }
-
-    try {
-      const task = await this.tasksService.update(session.userId, args[0], { status });
-      const label = status === TaskStatus.done ? 'выполнена' : 'в работе';
-      await ctx.reply(`Задача "${task.title}" — ${label}`);
-    } catch (e: any) {
-      await ctx.reply(`Ошибка: ${e.message}`);
-    }
-  }
-
-  private async handleDelete(ctx: Context): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
-    if (!session.userId) {
-      await ctx.reply('Сначала авторизуйтесь: /login или /register');
-      return;
-    }
-
-    const args = this.parseArgs(ctx);
-    if (!args[0]) {
-      await ctx.reply('Укажите ID задачи');
-      return;
-    }
-
-    try {
-      const task = await this.tasksService.archive(session.userId, args[0]);
-      await ctx.reply(`Задача "${task.title}" перемещена в архив`);
-    } catch (e: any) {
-      await ctx.reply(`Ошибка: ${e.message}`);
-    }
+  private async handleListByStatus(ctx: Context, status: TaskStatus): Promise<void> {
+    return this.handleList(ctx, status);
   }
 
   private async handleArchive(ctx: Context): Promise<void> {
     const session = this.getSession(ctx.chat!.id);
     if (!session.userId) {
-      await ctx.reply('Сначала авторизуйтесь: /login или /register');
+      await ctx.reply('Сначала авторизуйтесь', this.mainMenu(false));
       return;
     }
 
@@ -259,44 +289,69 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       });
 
       if (result.data.length === 0) {
-        await ctx.reply('Архив пуст');
+        await ctx.reply('📭 Архив пуст', this.mainMenu(true));
         return;
       }
 
-      const lines = result.data.map(
-        (t) => `🗑 ${t.title}\nID: ${t.id}\nУдалена: ${t.deletedAt?.toLocaleDateString()}`,
-      );
+      for (const task of result.data) {
+        await ctx.reply(
+          `🗑 ${task.title}\nУдалена: ${task.deletedAt?.toLocaleDateString()}`,
+          Markup.inlineKeyboard([
+            Markup.button.callback('♻️ Восстановить', `restore:${task.id}`),
+          ]),
+        );
+      }
 
-      await ctx.reply(`Архив (${result.meta.total}):\n\n${lines.join('\n\n')}`);
+      await ctx.reply(`Всего в архиве: ${result.meta.total}`, this.mainMenu(true));
     } catch (e: any) {
-      await ctx.reply(`Ошибка: ${e.message}`);
+      await ctx.reply(`❌ ${e.message}`, this.mainMenu(true));
     }
   }
 
-  private async handleRestore(ctx: Context): Promise<void> {
+  private async handleStatusAction(ctx: any): Promise<void> {
     const session = this.getSession(ctx.chat!.id);
-    if (!session.userId) {
-      await ctx.reply('Сначала авторизуйтесь: /login или /register');
-      return;
-    }
+    if (!session.userId) return;
 
-    const args = this.parseArgs(ctx);
-    if (!args[0]) {
-      await ctx.reply('Укажите ID задачи');
-      return;
-    }
+    const status = ctx.match[1] as TaskStatus;
+    const taskId = ctx.match[2];
 
     try {
-      const task = await this.tasksService.restore(session.userId, args[0]);
-      await ctx.reply(`Задача "${task.title}" восстановлена из архива`);
+      const task = await this.tasksService.update(session.userId, taskId, { status });
+      const label = { done: 'выполнена', in_progress: 'в работе', todo: 'todo' }[status];
+      await ctx.answerCbQuery(`${task.title} — ${label}`);
+      await ctx.editMessageText(`${STATUS_EMOJI[status]} ${task.title} — ${label}`);
     } catch (e: any) {
-      await ctx.reply(`Ошибка: ${e.message}`);
+      await ctx.answerCbQuery(`Ошибка: ${e.message}`);
     }
   }
 
-  private parseArgs(ctx: Context): string[] {
-    const text = (ctx.message as any)?.text || '';
-    const parts = text.split(/\s+/);
-    return parts.slice(1);
+  private async handleArchiveAction(ctx: any): Promise<void> {
+    const session = this.getSession(ctx.chat!.id);
+    if (!session.userId) return;
+
+    const taskId = ctx.match[1];
+
+    try {
+      const task = await this.tasksService.archive(session.userId, taskId);
+      await ctx.answerCbQuery(`${task.title} — в архиве`);
+      await ctx.editMessageText(`🗑 ${task.title} — в архиве`);
+    } catch (e: any) {
+      await ctx.answerCbQuery(`Ошибка: ${e.message}`);
+    }
+  }
+
+  private async handleRestoreAction(ctx: any): Promise<void> {
+    const session = this.getSession(ctx.chat!.id);
+    if (!session.userId) return;
+
+    const taskId = ctx.match[1];
+
+    try {
+      const task = await this.tasksService.restore(session.userId, taskId);
+      await ctx.answerCbQuery(`${task.title} — восстановлена`);
+      await ctx.editMessageText(`⬜ ${task.title} — восстановлена`);
+    } catch (e: any) {
+      await ctx.answerCbQuery(`Ошибка: ${e.message}`);
+    }
   }
 }

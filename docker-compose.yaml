@@ -4,10 +4,8 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: todo
-    ports:
-      - '5433:5432'
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -22,17 +20,10 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    env_file:
+      - .env
     environment:
-      PORT: 3000
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/todo?schema=public
-      JWT_SECRET: change-me-to-a-long-random-string
-      JWT_EXPIRES_IN: 1d
-      ARCHIVE_RETENTION_DAYS: 7
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
-      THROTTLE_TTL: 60000
-      THROTTLE_LIMIT: 100
-    ports:
-      - '3000:3000'
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@db:5432/todo?schema=public
 
 volumes:
   pgdata:

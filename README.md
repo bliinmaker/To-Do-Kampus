@@ -1,0 +1,196 @@
+# To-Do API
+
+Бэкенд сервиса управления задачами с JWT-аутентификацией, владельческим доступом
+к задачам и автоматическим архивом удалённых задач.
+
+**Стек:** TypeScript · NestJS · Prisma · PostgreSQL · Swagger · Docker · Jest
+
+---
+
+## Возможности
+
+| Требование | Реализация |
+|---|---|
+| Регистрация и аутентификация | JWT (`/auth/register`, `/auth/login`), пароли хэшируются (bcrypt) |
+| CRUD задач с привязкой к пользователю | Каждая задача принадлежит пользователю; чужие задачи недоступны |
+| Фильтрация по статусу + пагинация | `GET /tasks?status=&page=&limit=` |
+| Архив на 7 дней + восстановление | Удаление = soft delete (`deletedAt`); архив только для чтения; `PATCH /tasks/:id/restore` возвращает из архива; крон удаляет навсегда через N дней |
+| Безопасность | Хэш паролей, защита эндпоинтов JWT-гвардом, проверка владельца (403/404) |
+| Swagger | Доступен на `/docs` с примерами и Bearer-авторизацией |
+| Доп.: Docker | `docker-compose up` поднимает БД + API |
+| Доп.: Rate limiting | Глобальный throttler (по умолчанию 100 req / 60 c на IP) |
+| Доп.: Тесты | Jest, юнит-тесты сервисов |
+
+---
+
+## Архитектура
+
+Каждая фича — отдельный модуль с разделением слоёв:
+**контроллер** (HTTP, валидация, Swagger) → **сервис** (бизнес-логика) → **Prisma** (доступ к данным).
+
+```
+src/
+├── main.ts                 # точка входа: ValidationPipe, Swagger, shutdown hooks
+├── app.module.ts           # сборка модулей, throttler, scheduler
+├── prisma/                 # PrismaService (обёртка клиента) + глобальный модуль
+├── auth/                   # регистрация/логин, JWT-стратегия, guard, @CurrentUser
+├── users/                  # доступ к пользователям в БД
+└── tasks/
+    ├── tasks.controller.ts # эндпоинты задач
+    ├── tasks.service.ts    # CRUD, пагинация, проверка владельца, архив
+    ├── tasks-cleanup.service.ts # крон: удаление просроченных архивных задач
+    └── dto/                # валидация входа + схемы ответов для Swagger
+```
+
+---
+
+## Быстрый старт через Docker (рекомендуется)
+
+```bash
+cp .env.example .env        # секреты можно оставить дефолтные для локали
+docker compose up --build
+```
+
+Поднимется PostgreSQL и API, миграции применятся автоматически.
+Swagger: **http://localhost:3000/docs**
+
+## Локальный запуск
+
+```bash
+cp .env.example .env        # пропишите свой DATABASE_URL и JWT_SECRET
+npm install
+npm run prisma:generate
+npm run prisma:migrate      # применит миграции к вашей БД
+npm run start:dev
+```
+
+## Переменные окружения
+
+| Переменная | Назначение | По умолчанию |
+|---|---|---|
+| `PORT` | порт API | `3000` |
+| `DATABASE_URL` | строка подключения Postgres | — |
+| `JWT_SECRET` | секрет для подписи токенов | — |
+| `JWT_EXPIRES_IN` | срок жизни токена | `1d` |
+| `ARCHIVE_RETENTION_DAYS` | дней хранения архива до удаления | `7` |
+| `THROTTLE_TTL` / `THROTTLE_LIMIT` | окно (мс) / лимит запросов | `60000` / `100` |
+
+---
+
+## Примеры запросов (curl)
+
+Регистрация:
+```bash
+curl -X POST http://localhost:3000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"StrongPass123"}'
+```
+
+Логин (вернёт `accessToken`):
+```bash
+TOKEN=$(curl -s -X POST http://localhost:3000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@example.com","password":"StrongPass123"}' \
+  | npx --yes node-jq -r .accessToken)
+```
+> Или просто скопируйте `accessToken` из ответа и подставьте ниже вместо `$TOKEN`.
+
+Создать задачу:
+```bash
+curl -X POST http://localhost:3000/tasks \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"title":"Buy groceries","description":"Milk, eggs","status":"todo"}'
+```
+
+Список с фильтром и пагинацией:
+```bash
+curl "http://localhost:3000/tasks?status=todo&page=1&limit=10" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Одна задача / обновление / архивирование:
+```bash
+curl http://localhost:3000/tasks/<id> -H "Authorization: Bearer $TOKEN"
+
+curl -X PATCH http://localhost:3000/tasks/<id> \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"in_progress"}'
+
+curl -X DELETE http://localhost:3000/tasks/<id> -H "Authorization: Bearer $TOKEN"
+```
+
+Просмотр архива (только чтение):
+```bash
+curl "http://localhost:3000/tasks/archived" -H "Authorization: Bearer $TOKEN"
+```
+
+Восстановить задачу из архива:
+```bash
+curl -X PATCH http://localhost:3000/tasks/<id>/restore -H "Authorization: Bearer $TOKEN"
+```
+
+---
+
+## Тесты
+
+```bash
+npm test
+```
+
+Юнит-тесты покрывают: хэширование паролей и сценарии ошибок аутентификации,
+проверку владельца задачи (403/404), запрет редактирования архивной задачи (409),
+soft delete и расчёт пагинации.
+
+---
+
+## Ключевые решения (почему так)
+
+- **Soft delete вместо удаления.** «Удаление» проставляет `deletedAt`. Архивные
+  задачи исключены из основного списка и доступны только для чтения. Отдельный
+  крон-джоб (`@nestjs/schedule`) раз в сутки физически удаляет задачи старше
+  `ARCHIVE_RETENTION_DAYS`. Срок вынесен в конфиг, чтобы легко менять/тестировать.
+- **403 vs 404.** Если задачи нет — `404`; если есть, но владелец другой — `403`.
+  Это явно отражает разные ситуации. (Альтернатива — везде `404`, чтобы не
+  раскрывать существование чужих ресурсов; выбор зависит от модели угроз.)
+- **Пагинация в одной транзакции.** `count` и `findMany` выполняются через
+  `$transaction`, чтобы total и данные были консистентны.
+- **bcryptjs.** Чистый JS-хэшер без нативной сборки — проще деплой; API совпадает
+  с `bcrypt`.
+- **Глобальный `ValidationPipe`** с `whitelist`/`forbidNonWhitelisted` отсекает
+  лишние и невалидные поля до попадания в бизнес-логику.
+- **Валидация `JWT_SECRET` при старте.** Если секрет не задан или совпадает с
+  дефолтным, в dev-режиме выводится предупреждение, а в production приложение
+  не запустится.
+
+## Telegram-бот
+
+Бот позволяет управлять задачами прямо из Telegram. Для запуска:
+
+1. Создайте бота через [@BotFather](https://t.me/BotFather) и получите токен.
+2. Пропишите `TELEGRAM_BOT_TOKEN` в `.env` или `docker-compose.yml`.
+3. Запустите приложение — бот стартует автоматически.
+
+Команды бота:
+
+| Команда | Описание |
+|---|---|
+| `/register email password` | Регистрация |
+| `/login email password` | Вход |
+| `/logout` | Выход |
+| `/add текст` | Создать задачу |
+| `/list [todo\|in_progress\|done]` | Список задач |
+| `/done id` | Отметить выполненной |
+| `/progress id` | Перевести в работу |
+| `/delete id` | Архивировать |
+| `/archive` | Показать архив |
+| `/restore id` | Восстановить из архива |
+
+Если `TELEGRAM_BOT_TOKEN` не задан, бот просто не запускается — API работает как обычно.
+
+---
+
+## Возможные расширения
+
+- WebSockets (`@nestjs/websockets`) для пуша обновлений статусов в реальном времени.
+- Refresh-токены и ротация.
+- E2E-тесты через `supertest` против тестовой БД.

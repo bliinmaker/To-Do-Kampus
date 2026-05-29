@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { Prisma, Task } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { TasksCleanupService } from './tasks-cleanup.service';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
 import { QueryTasksDto } from './dto/query-tasks.dto';
@@ -13,7 +14,10 @@ import { PaginatedTasksDto } from './dto/task-response.dto';
 
 @Injectable()
 export class TasksService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly cleanupService: TasksCleanupService,
+  ) {}
 
   create(userId: string, dto: CreateTaskDto): Promise<Task> {
     return this.prisma.task.create({
@@ -56,10 +60,13 @@ export class TasksService {
       throw new ConflictException('Task is not archived');
     }
 
-    return this.prisma.task.update({
+    const restored = await this.prisma.task.update({
       where: { id },
       data: { deletedAt: null },
     });
+
+    await this.cleanupService.cancelCleanup(id);
+    return restored;
   }
 
   async archive(userId: string, id: string): Promise<Task> {
@@ -69,10 +76,13 @@ export class TasksService {
       throw new ConflictException('Task is already archived');
     }
 
-    return this.prisma.task.update({
+    const archived = await this.prisma.task.update({
       where: { id },
       data: { deletedAt: new Date() },
     });
+
+    await this.cleanupService.scheduleCleanup(id);
+    return archived;
   }
 
   private async getOwnedOrThrow(userId: string, id: string): Promise<Task> {

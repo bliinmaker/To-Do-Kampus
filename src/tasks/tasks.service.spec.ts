@@ -6,7 +6,13 @@ import {
 } from '@nestjs/common';
 import { TaskStatus } from '@prisma/client';
 import { TasksService } from './tasks.service';
+import { TasksCleanupService } from './tasks-cleanup.service';
 import { PrismaService } from '../prisma/prisma.service';
+
+const cleanupMock = {
+  scheduleCleanup: jest.fn(),
+  cancelCleanup: jest.fn(),
+};
 
 const prismaMock = {
   task: {
@@ -42,6 +48,7 @@ describe('TasksService', () => {
       providers: [
         TasksService,
         { provide: PrismaService, useValue: prismaMock },
+        { provide: TasksCleanupService, useValue: cleanupMock },
       ],
     }).compile();
     service = moduleRef.get(TasksService);

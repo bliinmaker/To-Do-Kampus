@@ -61,14 +61,14 @@ export class TasksCleanupService implements OnModuleInit, OnModuleDestroy {
   async scheduleCleanup(taskId: string): Promise<void> {
     await this.queue.add('delete-task', { taskId }, {
       delay: this.retentionMs,
-      jobId: `cleanup:${taskId}`,
+      jobId: `cleanup-${taskId}`,
       removeOnComplete: true,
       removeOnFail: false,
     });
   }
 
   async cancelCleanup(taskId: string): Promise<void> {
-    const job = await this.queue.getJob(`cleanup:${taskId}`);
+    const job = await this.queue.getJob(`cleanup-${taskId}`);
     if (job) await job.remove();
   }
 

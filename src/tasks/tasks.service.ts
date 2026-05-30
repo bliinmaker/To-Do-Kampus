@@ -7,6 +7,7 @@ import {
 import { Prisma, Task } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { TasksCleanupService } from './tasks-cleanup.service';
+import { TasksGateway, TaskEvent } from './tasks.gateway';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
 import { QueryTasksDto } from './dto/query-tasks.dto';
@@ -17,12 +18,15 @@ export class TasksService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly cleanupService: TasksCleanupService,
+    private readonly gateway: TasksGateway,
   ) {}
 
-  create(userId: string, dto: CreateTaskDto): Promise<Task> {
-    return this.prisma.task.create({
+  async create(userId: string, dto: CreateTaskDto): Promise<Task> {
+    const task = await this.prisma.task.create({
       data: { ...dto, userId },
     });
+    this.gateway.notifyUser(userId, TaskEvent.CREATED, task);
+    return task;
   }
 
   async findAll(
@@ -50,7 +54,9 @@ export class TasksService {
       throw new ConflictException('Archived tasks cannot be edited');
     }
 
-    return this.prisma.task.update({ where: { id }, data: dto });
+    const updated = await this.prisma.task.update({ where: { id }, data: dto });
+    this.gateway.notifyUser(userId, TaskEvent.UPDATED, updated);
+    return updated;
   }
 
   async restore(userId: string, id: string): Promise<Task> {
@@ -66,6 +72,7 @@ export class TasksService {
     });
 
     await this.cleanupService.cancelCleanup(id);
+    this.gateway.notifyUser(userId, TaskEvent.RESTORED, restored);
     return restored;
   }
 
@@ -82,6 +89,7 @@ export class TasksService {
     });
 
     await this.cleanupService.scheduleCleanup(id);
+    this.gateway.notifyUser(userId, TaskEvent.ARCHIVED, archived);
     return archived;
   }
 

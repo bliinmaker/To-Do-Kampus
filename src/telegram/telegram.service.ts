@@ -1,6 +1,7 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { Telegraf, Context, Markup } from 'telegraf';
+import Redis from 'ioredis';
 import { AuthService } from '../auth/auth.service';
 import { TasksService } from '../tasks/tasks.service';
 import { TaskStatus } from '@prisma/client';
@@ -25,11 +26,13 @@ const STATUS_EMOJI: Record<string, string> = {
   done: '✅',
 };
 
+const SESSION_TTL = 60 * 60 * 24 * 7;
+
 @Injectable()
 export class TelegramService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(TelegramService.name);
   private bot: Telegraf | null = null;
-  private readonly sessions = new Map<number, SessionData>();
+  private redis: Redis | null = null;
 
   constructor(
     private readonly config: ConfigService,
@@ -44,6 +47,12 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
+    this.redis = new Redis({
+      host: this.config.get('REDIS_HOST', 'localhost'),
+      port: Number(this.config.get('REDIS_PORT', 6379)),
+      keyPrefix: 'tg:session:',
+    });
+
     this.bot = new Telegraf(token);
     this.setupHandlers();
     this.bot.launch()
@@ -53,13 +62,20 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
 
   async onModuleDestroy(): Promise<void> {
     this.bot?.stop();
+    this.redis?.disconnect();
   }
 
-  private getSession(chatId: number): SessionData {
-    if (!this.sessions.has(chatId)) {
-      this.sessions.set(chatId, {});
-    }
-    return this.sessions.get(chatId)!;
+  private async getSession(chatId: number): Promise<SessionData> {
+    const raw = await this.redis?.get(String(chatId));
+    return raw ? JSON.parse(raw) : {};
+  }
+
+  private async saveSession(chatId: number, session: SessionData): Promise<void> {
+    await this.redis?.set(String(chatId), JSON.stringify(session), 'EX', SESSION_TTL);
+  }
+
+  private async deleteSession(chatId: number): Promise<void> {
+    await this.redis?.del(String(chatId));
   }
 
   private mainMenu(loggedIn: boolean) {
@@ -99,8 +115,9 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleStart(ctx: Context): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     session.waitingFor = undefined;
+    await this.saveSession(ctx.chat!.id, session);
 
     await ctx.reply(
       '👋 Привет! Я бот для управления задачами.\n\nВыберите действие:',
@@ -109,29 +126,32 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async startRegister(ctx: Context): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     session.waitingFor = 'register_email';
+    await this.saveSession(ctx.chat!.id, session);
     await ctx.reply('📧 Введите ваш email:', Markup.forceReply());
   }
 
   private async startLogin(ctx: Context): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     session.waitingFor = 'login_email';
+    await this.saveSession(ctx.chat!.id, session);
     await ctx.reply('📧 Введите ваш email:', Markup.forceReply());
   }
 
   private async handleLogout(ctx: Context): Promise<void> {
-    this.sessions.delete(ctx.chat!.id);
+    await this.deleteSession(ctx.chat!.id);
     await ctx.reply('👋 Вы вышли из аккаунта', this.mainMenu(false));
   }
 
   private async startAddTask(ctx: Context): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     if (!session.userId) {
       await ctx.reply('Сначала авторизуйтесь', this.mainMenu(false));
       return;
     }
     session.waitingFor = 'add_title';
+    await this.saveSession(ctx.chat!.id, session);
     await ctx.reply('📝 Введите название задачи:', Markup.forceReply());
   }
 
@@ -139,12 +159,13 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
     const text = (ctx.message as any)?.text;
     if (!text) return;
 
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
 
     switch (session.waitingFor) {
       case 'register_email':
         session.tempEmail = text.trim();
         session.waitingFor = 'register_password';
+        await this.saveSession(ctx.chat!.id, session);
         await ctx.reply('🔑 Введите пароль (мин. 8 символов):', Markup.forceReply());
         return;
 
@@ -155,6 +176,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
       case 'login_email':
         session.tempEmail = text.trim();
         session.waitingFor = 'login_password';
+        await this.saveSession(ctx.chat!.id, session);
         await ctx.reply('🔑 Введите пароль:', Markup.forceReply());
         return;
 
@@ -169,43 +191,40 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async finishRegister(ctx: Context, session: SessionData, password: string): Promise<void> {
-    session.waitingFor = undefined;
     const email = session.tempEmail!;
-    session.tempEmail = undefined;
 
     try {
       const result = await this.authService.register({ email, password });
-      session.userId = result.user.id;
-      session.email = result.user.email;
+      await this.saveSession(ctx.chat!.id, { userId: result.user.id, email: result.user.email });
       await ctx.reply(
         `✅ Регистрация успешна!\n\nВы вошли как ${email}`,
         this.mainMenu(true),
       );
     } catch (e: any) {
+      await this.saveSession(ctx.chat!.id, {});
       await ctx.reply(`❌ ${e.message}`, this.mainMenu(false));
     }
   }
 
   private async finishLogin(ctx: Context, session: SessionData, password: string): Promise<void> {
-    session.waitingFor = undefined;
     const email = session.tempEmail!;
-    session.tempEmail = undefined;
 
     try {
       const result = await this.authService.login({ email, password });
-      session.userId = result.user.id;
-      session.email = result.user.email;
+      await this.saveSession(ctx.chat!.id, { userId: result.user.id, email: result.user.email });
       await ctx.reply(
         `✅ Вы вошли как ${email}`,
         this.mainMenu(true),
       );
     } catch (e: any) {
+      await this.saveSession(ctx.chat!.id, {});
       await ctx.reply(`❌ ${e.message}`, this.mainMenu(false));
     }
   }
 
   private async finishAddTask(ctx: Context, session: SessionData, title: string): Promise<void> {
     session.waitingFor = undefined;
+    await this.saveSession(ctx.chat!.id, session);
 
     if (!title) {
       await ctx.reply('Название не может быть пустым', this.mainMenu(true));
@@ -224,7 +243,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleList(ctx: Context, status?: TaskStatus): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     if (!session.userId) {
       await ctx.reply('Сначала авторизуйтесь', this.mainMenu(false));
       return;
@@ -277,7 +296,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleArchive(ctx: Context): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     if (!session.userId) {
       await ctx.reply('Сначала авторизуйтесь', this.mainMenu(false));
       return;
@@ -310,7 +329,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleStatusAction(ctx: any): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     if (!session.userId) return;
 
     const status = ctx.match[1] as TaskStatus;
@@ -327,7 +346,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleArchiveAction(ctx: any): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     if (!session.userId) return;
 
     const taskId = ctx.match[1];
@@ -342,7 +361,7 @@ export class TelegramService implements OnModuleInit, OnModuleDestroy {
   }
 
   private async handleRestoreAction(ctx: any): Promise<void> {
-    const session = this.getSession(ctx.chat!.id);
+    const session = await this.getSession(ctx.chat!.id);
     if (!session.userId) return;
 
     const taskId = ctx.match[1];

@@ -33,18 +33,11 @@ async function bootstrap(): Promise<void> {
   const document = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('docs', app, document);
 
-  console.log('[1] shutdown hooks');
   app.enableShutdownHooks();
 
   const port = Number(config.get('PORT', 3000));
-  console.log(`[2] calling listen on port ${port}`);
-  try {
-    await app.listen(port);
-    console.log(`API running on http://localhost:${port} (docs at /docs)`);
-  } catch (err) {
-    console.error('[FATAL] listen failed:', err);
-    process.exit(1);
-  }
+  await app.listen(port);
+  console.log(`API running on http://localhost:${port} (docs at /docs)`);
 }
 
 bootstrap().catch((err) => {
